@@ -1,0 +1,15 @@
+[project]
+name = "whisper-mojo"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "datasets>=4.4.2",
+    "modular>=25.7.0",
+    "numpy>=2.4.0",
+    "soundfile>=0.13.1",
+    "torch>=2.9.1",
+    "torchcodec>=0.9.1",
+    "transformers>=4.57.3",
+]
