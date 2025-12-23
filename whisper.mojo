@@ -1,5 +1,5 @@
 from whisper_tensor import Tensor, conv1d, layer_norm, matmul, gelu, argmax
-from layers import ResidualAttentionBlock
+from layers import ResidualAttentionBlock, KVCache, LayerCache
 from loader import WeightLoader
 from math import sin, cos
 from collections import List
@@ -76,7 +76,10 @@ struct WhisperEncoder:
                 x.set(i, j, x2.get(j, i) + self.pos_emb.get(i, j))
 
         for i in range(len(self.blocks)):
-            x = self.blocks[i].forward(x)
+            var dummy_cache = LayerCache()
+            x = self.blocks[i].forward(
+                x, Tensor(0, 0), dummy_cache, use_cache=False
+            )
 
         var out = Tensor(x.rows, x.cols)
         layer_norm(out, x, self.ln_post_w, self.ln_post_b)
@@ -111,7 +114,14 @@ struct WhisperDecoder:
         self.ln_post_w = loader.next_tensor(1, 384)
         self.ln_post_b = loader.next_tensor(1, 384)
 
-    fn forward(self, tokens: List[Int], enc_out: Tensor) -> Tensor:
+    fn forward(
+        self,
+        tokens: List[Int],
+        enc_out: Tensor,
+        mut cache: KVCache,
+        use_cache: Bool = False,
+        start_pos: Int = 0,
+    ) -> Tensor:
         var L_tgt = len(tokens)
         var x = Tensor(L_tgt, 384)
         for i in range(L_tgt):
@@ -120,11 +130,14 @@ struct WhisperDecoder:
                 x.set(
                     i,
                     j,
-                    self.token_emb.get(token_id, j) + self.pos_emb.get(i, j),
+                    self.token_emb.get(token_id, j)
+                    + self.pos_emb.get(start_pos + i, j),
                 )
 
         for i in range(len(self.blocks)):
-            x = self.blocks[i].forward(x, enc_out)
+            x = self.blocks[i].forward(
+                x, enc_out, cache=cache.layers[i], use_cache=use_cache
+            )
 
         var out = Tensor(x.rows, x.cols)
         layer_norm(out, x, self.ln_post_w, self.ln_post_b)
@@ -160,11 +173,32 @@ struct Whisper:
         tokens.append(50359)  # <|transcribe|>
         tokens.append(50363)  # <|notimestamps|>
 
-        for _ in range(200):
-            var logits = self.decoder.forward(tokens, enc_out)
-            var next_token = argmax(logits)
-            tokens.append(next_token)
+        # Pre-allocate KV cache for the decoder
+        var cache = KVCache(self.config.n_layers, self.config.d_model, 448)
+
+        # First pass: process the prefix tokens to fill the cache
+        var logits = self.decoder.forward(
+            tokens, enc_out, cache=cache, use_cache=True, start_pos=0
+        )
+        var next_token = argmax(logits)
+        tokens.append(next_token)
+
+        for _ in range(195):  # Already produced 1 token from prefix
             if next_token == 50257:  # <|endoftext|>
                 break
+
+            # Incremental pass: only process the LAST token
+            var last_token_list = List[Int]()
+            last_token_list.append(next_token)
+
+            logits = self.decoder.forward(
+                last_token_list,
+                enc_out,
+                cache=cache,
+                use_cache=True,
+                start_pos=len(tokens) - 1,
+            )
+            next_token = argmax(logits)
+            tokens.append(next_token)
 
         return tokens^

@@ -1,6 +1,63 @@
 from whisper_tensor import Tensor, matmul, layer_norm, softmax, gelu
 from loader import WeightLoader
 from math import sqrt
+from algorithm import parallelize
+
+
+struct LayerCache(Copyable, ImplicitlyCopyable, Movable):
+    var self_k: Tensor
+    var self_v: Tensor
+    var cross_k: Tensor
+    var cross_v: Tensor
+    var current_len: Int
+    var has_cross: Bool
+
+    fn __init__(out self):
+        self.self_k = Tensor(0, 0)
+        self.self_v = Tensor(0, 0)
+        self.cross_k = Tensor(0, 0)
+        self.cross_v = Tensor(0, 0)
+        self.current_len = 0
+        self.has_cross = False
+
+    fn reset(mut self, d_model: Int, max_len: Int):
+        self.self_k = Tensor(max_len, d_model)
+        self.self_v = Tensor(max_len, d_model)
+        self.current_len = 0
+        self.has_cross = False
+
+    fn __moveinit__(out self, deinit existing: Self):
+        self.self_k = existing.self_k^
+        self.self_v = existing.self_v^
+        self.cross_k = existing.cross_k^
+        self.cross_v = existing.cross_v^
+        self.current_len = existing.current_len
+        self.has_cross = existing.has_cross
+
+    fn __copyinit__(out self, existing: Self):
+        self.self_k = existing.self_k
+        self.self_v = existing.self_v
+        self.cross_k = existing.cross_k
+        self.cross_v = existing.cross_v
+        self.current_len = existing.current_len
+        self.has_cross = existing.has_cross
+
+
+struct KVCache(Copyable, ImplicitlyCopyable, Movable):
+    var layers: List[LayerCache]
+
+    fn __init__(out self, n_layers: Int, d_model: Int, max_len: Int):
+        self.layers = List[LayerCache]()
+        for _ in range(n_layers):
+            var layer = LayerCache()
+            layer.reset(d_model, max_len)
+            self.layers.append(layer)
+
+    fn __moveinit__(out self, deinit existing: Self):
+        self.layers = existing.layers^
+
+    fn __copyinit__(out self, existing: Self):
+        self.layers = existing.layers.copy()
 
 
 struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
@@ -37,7 +94,14 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
         self.out_proj_b = loader.next_tensor(1, self.d_model)
 
     fn forward(
-        self, query: Tensor, key: Tensor, value: Tensor, mask: Bool = False
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        mask: Bool,
+        mut cache: LayerCache,
+        is_self_attn: Bool,
+        use_cache: Bool,
     ) -> Tensor:
         var q_len = query.rows
         var k_len = key.rows
@@ -45,21 +109,68 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
         var q = Tensor(q_len, self.d_model)
         matmul(q, query, self.q_proj_w, self.q_proj_b)
 
-        var k = Tensor(k_len, self.d_model)
-        var k_bias_empty = Tensor(0, 0)
-        matmul(k, key, self.k_proj_w, k_bias_empty)
+        var k: Tensor
+        var v: Tensor
 
-        var v = Tensor(k_len, self.d_model)
-        matmul(v, value, self.v_proj_w, self.v_proj_b)
+        if use_cache:
+            if is_self_attn:
+                # Compute k, v for the new tokens
+                var new_k = Tensor(q_len, self.d_model)
+                var k_bias_empty = Tensor(0, 0)
+                matmul(new_k, key, self.k_proj_w, k_bias_empty)
+                var new_v = Tensor(q_len, self.d_model)
+                matmul(new_v, value, self.v_proj_w, self.v_proj_b)
 
+                # Append to cache
+                for i in range(q_len):
+                    for j in range(self.d_model):
+                        cache.self_k.set(
+                            cache.current_len + i, j, new_k.get(i, j)
+                        )
+                        cache.self_v.set(
+                            cache.current_len + i, j, new_v.get(i, j)
+                        )
+                cache.current_len += q_len
+
+                # Use full cache for attention
+                k = Tensor(cache.current_len, self.d_model)
+                v = Tensor(cache.current_len, self.d_model)
+                # This is a bit slow (copying), but simpler for now.
+                # Optimized version would use slices or direct access in the worker.
+                for i in range(cache.current_len):
+                    for j in range(self.d_model):
+                        k.set(i, j, cache.self_k.get(i, j))
+                        v.set(i, j, cache.self_v.get(i, j))
+            else:
+                # Cross attention
+                if not cache.has_cross:
+                    var ck = Tensor(k_len, self.d_model)
+                    var k_bias_empty = Tensor(0, 0)
+                    matmul(ck, key, self.k_proj_w, k_bias_empty)
+                    var cv = Tensor(k_len, self.d_model)
+                    matmul(cv, value, self.v_proj_w, self.v_proj_b)
+                    cache.cross_k = ck^
+                    cache.cross_v = cv^
+                    cache.has_cross = True
+                k = cache.cross_k
+                v = cache.cross_v
+        else:
+            k = Tensor(k_len, self.d_model)
+            var k_bias_empty = Tensor(0, 0)
+            matmul(k, key, self.k_proj_w, k_bias_empty)
+            v = Tensor(k_len, self.d_model)
+            matmul(v, value, self.v_proj_w, self.v_proj_b)
+
+        var final_k_len = k.rows
         var out = Tensor(q_len, self.d_model)
 
-        for h in range(self.n_heads):
-            var scores = Tensor(q_len, k_len)
+        @parameter
+        fn head_worker(h: Int):
+            var scores = Tensor(q_len, final_k_len)
             var scale = 1.0 / sqrt(Float32(self.head_dim))
 
             for i in range(q_len):
-                for j in range(k_len):
+                for j in range(final_k_len):
                     var dot: Float32 = 0.0
                     for d in range(self.head_dim):
                         var q_val = q.get(i, h * self.head_dim + d)
@@ -67,7 +178,20 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
                         dot += q_val * k_val
 
                     var score = dot * scale
-                    if mask and j > i:
+                    if mask and j > (
+                        cache.current_len - q_len + i if use_cache
+                        and is_self_attn else j
+                    ):
+                        # Masking logic for incremental decoding:
+                        # tokens can only see themselves and previous tokens.
+                        # If not using cache or not self-attn, j > i is the standard causal mask.
+                        # Wait, j > i is simpler.
+                        pass
+
+                    if mask and j > (
+                        cache.current_len - q_len + i if use_cache
+                        and is_self_attn else i
+                    ):
                         score = -1e10
 
                     scores.set(i, j, score)
@@ -77,11 +201,13 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
             for i in range(q_len):
                 for d in range(self.head_dim):
                     var val: Float32 = 0.0
-                    for j in range(k_len):
+                    for j in range(final_k_len):
                         val += scores.get(i, j) * v.get(
                             j, h * self.head_dim + d
                         )
                     out.set(i, h * self.head_dim + d, val)
+
+        parallelize[head_worker](self.n_heads)
 
         var final_out = Tensor(q_len, self.d_model)
         matmul(final_out, out, self.out_proj_w, self.out_proj_b)
@@ -161,12 +287,24 @@ struct ResidualAttentionBlock(Copyable, ImplicitlyCopyable, Movable):
         self.mlp_ln_w = loader.next_tensor(1, self.d_model)
         self.mlp_ln_b = loader.next_tensor(1, self.d_model)
 
-    fn forward(self, x: Tensor, enc_out: Tensor = Tensor(0, 0)) -> Tensor:
+    fn forward(
+        self,
+        x: Tensor,
+        enc_out: Tensor,
+        mut cache: LayerCache,
+        use_cache: Bool,
+    ) -> Tensor:
         var x_norm = Tensor(x.rows, x.cols)
         layer_norm(x_norm, x, self.attn_ln_w, self.attn_ln_b)
 
         var self_attn_out = self.attn.forward(
-            x_norm, x_norm, x_norm, mask=self.is_decoder
+            x_norm,
+            x_norm,
+            x_norm,
+            mask=self.is_decoder,
+            cache=cache,
+            is_self_attn=True,
+            use_cache=use_cache,
         )
 
         var current_x = Tensor(x.rows, x.cols)
@@ -183,7 +321,13 @@ struct ResidualAttentionBlock(Copyable, ImplicitlyCopyable, Movable):
             )
 
             var cross_attn_out = self.cross_attn.forward(
-                x_norm_cross, enc_out, enc_out
+                x_norm_cross,
+                enc_out,
+                enc_out,
+                mask=False,
+                cache=cache,
+                is_self_attn=False,
+                use_cache=use_cache,
             )
 
             var x_res2 = Tensor(current_x.rows, current_x.cols)

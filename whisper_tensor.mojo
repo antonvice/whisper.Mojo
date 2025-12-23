@@ -1,5 +1,6 @@
 from memory import LegacyUnsafePointer, memcpy, memset_zero
 from math import sqrt, tanh, exp
+from algorithm import parallelize
 
 
 struct Tensor(Copyable, ImplicitlyCopyable, Movable):
@@ -50,7 +51,9 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
 
 fn matmul(mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor):
     alias width = 8
-    for m in range(A.rows):
+
+    @parameter
+    fn worker(m: Int):
         for n in range(B.rows):
             var sum = SIMD[DType.float32, width](0.0)
             for k in range(0, A.cols, width):
@@ -62,6 +65,8 @@ fn matmul(mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor):
                 final_sum += bias.data[n]
             C.store(m * C.cols + n, final_sum)
 
+    parallelize[worker](A.rows)
+
 
 fn layer_norm(
     mut out: Tensor,
@@ -71,8 +76,11 @@ fn layer_norm(
     eps: Float32 = 1e-5,
 ):
     alias width = 8
+    var rows = inp.rows
     var cols = inp.cols
-    for i in range(inp.rows):
+
+    @parameter
+    fn worker(i: Int):
         var sum: Float32 = 0.0
         var sq_sum: Float32 = 0.0
         for j in range(cols):
@@ -93,12 +101,17 @@ fn layer_norm(
             ](inv_std) * g + b
             out.data.store(i * cols + j, res)
 
+    parallelize[worker](rows)
+
 
 fn gelu(mut t: Tensor):
     alias width = 8
     var SQRT_2_PI = Float32(0.79788456)
     var COEFF = Float32(0.044715)
-    for i in range(0, t.size, width):
+
+    @parameter
+    fn worker(i_block: Int):
+        var i = i_block * width
         var x = t.data.load[width=width](i)
         var x3 = x * x * x
         var inner = SIMD[DType.float32, width](SQRT_2_PI) * (
@@ -111,9 +124,12 @@ fn gelu(mut t: Tensor):
         )
         t.data.store(i, res)
 
+    parallelize[worker](t.size // width)
+
 
 fn softmax(mut t: Tensor):
-    for i in range(t.rows):
+    @parameter
+    fn worker(i: Int):
         var max_val = t.get(i, 0)
         for j in range(1, t.cols):
             var val = t.get(i, j)
@@ -128,6 +144,8 @@ fn softmax(mut t: Tensor):
 
         for j in range(t.cols):
             t.set(i, j, t.get(i, j) / sum_exp)
+
+    parallelize[worker](t.rows)
 
 
 fn conv1d(
@@ -144,7 +162,8 @@ fn conv1d(
     var L_in = inp.cols
     var K = weight.size // (C_out * C_in)
 
-    for co in range(C_out):
+    @parameter
+    fn worker(co: Int):
         for lo in range(L_out):
             var sum: Float32 = 0.0
             var start_l = lo * stride - padding
@@ -158,6 +177,8 @@ fn conv1d(
             if bias.size > 0:
                 sum += bias.load(co)
             out.set(co, lo, sum)
+
+    parallelize[worker](C_out)
 
 
 fn argmax(t: Tensor) -> Int:

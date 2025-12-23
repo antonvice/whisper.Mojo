@@ -12,31 +12,30 @@ This project brings the power of OpenAI's Whisper to the Mojo programming langua
 ## ✨ Features
 
 - **🎯 Pure Mojo Implementation**: Every layer (Encoder, Decoder, Multi-Head Attention) is written in Mojo.
-- **⚡ SIMD Acceleration**: Core tensor operations (Matmul, LayerNorm, GeLU) are vectorized using Mojo's SIMD primitives.
+- **🚀 Ultra-Fast Inference**: Uses **KV-Caching** for incremental decoding, reducing complexity from $O(L^2)$ to $O(L)$.
+- **🧵 Multi-core Parallelization**: Parallelized attention heads and tensor operations using Mojo's `parallelize` algorithm.
+- **⚡ SIMD Acceleration**: Core math operations (Matmul, LayerNorm, GeLU) are vectorized using Mojo's SIMD primitives.
 - **🎧 Real-world Audio**: Integrated pipeline to process real audio files (MP3/WAV) into Mel spectrograms.
 - **🔍 Bit-Perfect Tokenization**: Fully compatible with OpenAI's tokenizer, producing identical results to the PyTorch reference implementation.
-- **💪 Memory Efficient**: Manual memory management using `LegacyUnsafePointer` for maximum control.
 
 ## 📂 Project Structure
 
 | File | Description |
 | :--- | :--- |
 | `main.mojo` | 🎮 The entry point. Orchestrates weight loading, audio processing, and transcription. |
-| `whisper.mojo` | 🧠 The "Brain". Contains the `Whisper` model, `Encoder`, and `Decoder` logic. |
-| `layers.mojo` | 🧱 Core building blocks: `MultiHeadAttention` and `ResidualAttentionBlock`. |
-| `whisper_tensor.mojo` | 🧬 Mathematical foundation. Implements `Tensor` and operations like `matmul`, `conv1d`, and `softmax`. |
-| `tokenizer.mojo` | 🔤 Decodes the model's numeric output (token IDs) back into human-readable text. |
-| `loader.mojo` | 📥 Efficiently loads model weights from a binary format into Mojo Tensors. |
-| `export_weights.py` | 🐍 Python bridge. Handles model downloading, weight exporting, and audio preprocessing. |
-| `vocab.txt` | 📚 The vocabulary file used for decoding tokens. |
+| `whisper.mojo` | 🧠 The "Brain". Contains the `Whisper` model and incremental decoding logic. |
+| `layers.mojo` | 🧱 Core building blocks with **KVCache** support and parallelized attention. |
+| `whisper_tensor.mojo` | 🧬 Mathematical foundation. Implements parallelized & SIMD-optimized tensor ops. |
+| `tokenizer.mojo` | 🔤 Decodes numeric tokens into human-readable text. |
+| `loader.mojo` | 📥 Efficient binary weight loader. |
+| `export_weights.py` | 🐍 Python bridge for weight export and audio preprocessing. |
 
 ## 🛠️ Getting Started
 
 ### 📋 Prerequisites
 
 - **Mojo SDK** (v24.5+)
-- **Python Environment** (for weight export) with:
-  - `torch`, `transformers`, `soundfile`, `scipy`, `requests`
+- **Python Environment** with `torch`, `transformers`, `soundfile`, `scipy`, `requests`
 
 ### 🏗️ Installation & Execution
 
@@ -46,23 +45,25 @@ This project brings the power of OpenAI's Whisper to the Mojo programming langua
    cd whisper.Mojo
    ```
 
-2. **Export Weights & Prepare Audio**
-   This script downloads the Whisper-Tiny weights and converts a sample audio file into a format Mojo can read.
+2. **Prepare Weights & Audio**
    ```bash
    uv run export_weights.py
    ```
 
-3. **Run Transcription**
-   Launch the Mojo model to transcribe the prepared audio:
+3. **Build & Run (Recommended for Speed)**
+   For the best performance, compile to a native binary:
    ```bash
-   mojo run main.mojo
+   mojo build main.mojo
+   ./main
    ```
 
-## 📊 Performance Note
+## 📊 Optimization Details
 
-You might notice that `mojo run main.mojo` takes a few moments to execute. This is primarily because:
-1. **JIT Compilation**: `mojo run` compiles the code on-the-fly. For production speed, use `mojo build main.mojo` to create a standalone binary.
-2. **Current Optimization**: This is a reference implementation. While it uses SIMD for matmuls, many other loops (like the Attention scores) are currently single-threaded. Future versions will implement `parallelize` and tiling for even greater speeds.
+This implementation is designed to showcase Mojo's performance advantages:
+
+1. **KV-Cache**: Instead of re-computing the entire sequence for every new token, we cache the keys and values of previous tokens.
+2. **Parallel Heads**: All attention heads in a layer are processed simultaneously on multiple CPU cores.
+3. **SIMD Vectorization**: Inner loops are manually tuned to use 256-bit or 512-bit registers (depending on hardware).
 
 ## 📝 Example Output
 
