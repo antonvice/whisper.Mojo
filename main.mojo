@@ -1,3 +1,4 @@
+from time import perf_counter
 from whisper import Whisper, WhisperConfig
 from whisper_tensor import Tensor
 from loader import WeightLoader
@@ -25,10 +26,12 @@ fn main() raises:
         var src = bytes.unsafe_ptr().bitcast[Float32]()
         memcpy(dest=mel.data, src=src, count=80 * 3000)
 
-    print("Running forward pass (transcribe)...")
+    var start = perf_counter()
     var tokens = whisper.transcribe(mel)
+    var end = perf_counter()
 
     print("Successfully ran forward pass.")
+    print("Transcription time: ", end - start, "seconds")
     print("\nToken IDs:")
     for i in range(len(tokens)):
         print(tokens[i], end=" ")
