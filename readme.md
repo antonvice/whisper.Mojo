@@ -78,7 +78,15 @@ Transcription:
 
 ## 📈 Changelog
 
-### [2025-12-26] - Performance Optimization Sprint
+### [2025-12-26] - Performance Optimization Sprint (Part 2)
+- **🚀 Advanced `conv1d` Vectorization**: Implemented a "Transpose-DotProduct" strategy for 1D convolutions, enabling full SIMD utilization. Optimized core Whisper filters (K=3) with manual unrolling and hoisting of accumulation logic.
+- **⚡ Matrix-Matrix Matmul Tiling**: Enhanced the matrix multiplication kernel with 8x tiling and unrolling for the $N$ dimension. This significantly reduced memory pressure and improved throughput for large encoder blocks ($M=1500$).
+- **🧬 Optimized Prefill (Attention)**: Optimized the prefill/encoder path by switching from manual scalar loops to high-performance `matmul`-based head processing. Added parallelized extraction and scatter of attention heads.
+- **💾 Layout-Aware Weight Loading**: Integrated pre-transposition of convolutional weights during model loading to ensure optimal memory layout for inference.
+- **🛡️ Robust SIMD Kernels**: Implemented generalized tail-handling in `matmul` and `conv1d`, ensuring stability across arbitrary sequence lengths and filter sizes.
+- **📈 Benchmark Results**: Successfully reduced total transcription time to **~1.59s** (from ~3.3s), achieving a **2x overall speedup**. Encoder runtime reduced by over 35%.
+
+### [2025-12-25] - Performance Optimization Sprint (Part 1)
 *   **🚀 Optimized Matmul**: Implemented dynamic parallelization that adapts to matrix shapes. Added 1D tiling for better cache reuse and switched to hardware-native SIMD widths using `simdwidthof`.
 *   **⚡ Vectorized Attention**: Fully vectorized the inner loops of `MultiHeadAttention`, accelerating both the dot-product score calculation and the weighted value sum.
 *   **🧬 Optimized Tensor Primitives**: Vectorized `LayerNorm`, `Softmax`, and `GeLU` operations. Added safe tail-handling for non-multiple sequence lengths.

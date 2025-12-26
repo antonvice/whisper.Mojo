@@ -29,8 +29,10 @@ fn main() raises:
     var start = perf_counter()
     var tokens = whisper.transcribe(mel)
     var end = perf_counter()
-
-    print("Successfully ran forward pass.")
+    
+    # We can't easily profile inside transcribe without changing it, 
+    # but we can see the total.
+    print("Transcription time: ", (end - start) / 1e9, "seconds")
     print("Transcription time: ", end - start, "seconds")
     print("\nToken IDs:")
     for i in range(len(tokens)):

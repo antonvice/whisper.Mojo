@@ -1,4 +1,8 @@
-from whisper_tensor import Tensor, conv1d, layer_norm, matmul, gelu, argmax
+from whisper_tensor import Tensor, conv1d, layer_norm, matmul, gelu, argmax, transpose_conv_weights
+from memory import memcpy, LegacyUnsafePointer
+from algorithm import parallelize
+from sys import simd_width_of as simdwidthof
+from time import perf_counter
 from layers import ResidualAttentionBlock, KVCache, LayerCache
 from loader import WeightLoader
 from math import sin, cos
@@ -51,9 +55,10 @@ struct WhisperEncoder:
         self.ln_post_b = Tensor(0, 0)
 
     fn load(mut self, mut loader: WeightLoader):
-        self.conv1_w = loader.next_tensor(384, 80 * 3)
+        self.conv1_w = transpose_conv_weights(loader.next_tensor(384, 80 * 3), 384, 80, 3)
         self.conv1_b = loader.next_tensor(1, 384)
-        self.conv2_w = loader.next_tensor(384, 384 * 3)
+        
+        self.conv2_w = transpose_conv_weights(loader.next_tensor(384, 384 * 3), 384, 384, 3)
         self.conv2_b = loader.next_tensor(1, 384)
         self.pos_emb = loader.next_tensor(1500, 384)
         for i in range(len(self.blocks)):
@@ -71,9 +76,16 @@ struct WhisperEncoder:
         gelu(x2)
 
         var x = Tensor(1500, 384)
-        for i in range(1500):
-            for j in range(384):
-                x.set(i, j, x2.get(j, i) + self.pos_emb.get(i, j))
+        alias width = simdwidthof[DType.float32]()
+        @parameter
+        fn prep_worker(i: Int):
+            for j in range(0, 384, width):
+                var val = SIMD[DType.float32, width](0.0)
+                var p_vec = self.pos_emb.data.load[width=width](i * 384 + j)
+                for w_idx in range(width):
+                    val[w_idx] = x2.data[(j + w_idx) * 1500 + i] + p_vec[w_idx]
+                x.data.store[width=width](i * 384 + j, val)
+        parallelize[prep_worker](1500)
 
         for i in range(len(self.blocks)):
             var dummy_cache = LayerCache()
@@ -83,7 +95,7 @@ struct WhisperEncoder:
 
         var out = Tensor(x.rows, x.cols)
         layer_norm(out, x, self.ln_post_w, self.ln_post_b)
-        return out^
+        return out
 
 
 struct WhisperDecoder:
@@ -143,8 +155,7 @@ struct WhisperDecoder:
         layer_norm(out, x, self.ln_post_w, self.ln_post_b)
 
         var last_hidden = Tensor(1, 384)
-        for j in range(384):
-            last_hidden.store(j, out.get(L_tgt - 1, j))
+        memcpy(dest=last_hidden.data, src=out.data.offset((L_tgt - 1) * 384), count=384)
 
         var logits = Tensor(1, 51865)
         matmul(logits, last_hidden, self.token_emb, Tensor(0, 0))
@@ -167,6 +178,7 @@ struct Whisper:
 
     fn transcribe(self, mel: Tensor) -> List[Int]:
         var enc_out = self.encoder.forward(mel)
+
         var tokens = List[Int]()
         tokens.append(50258)  # <|startoftranscript|>
         tokens.append(50259)  # <|en|>
@@ -181,7 +193,11 @@ struct Whisper:
             tokens, enc_out, cache=cache, use_cache=True, start_pos=0
         )
         var next_token = argmax(logits)
-        tokens.append(next_token)
+        
+        var all_tokens = List[Int]()
+        for i in range(len(tokens)):
+            all_tokens.append(tokens[i])
+        all_tokens.append(next_token)
 
         for _ in range(195):  # Already produced 1 token from prefix
             if next_token == 50257:  # <|endoftext|>
@@ -196,9 +212,9 @@ struct Whisper:
                 enc_out,
                 cache=cache,
                 use_cache=True,
-                start_pos=len(tokens) - 1,
+                start_pos=cache.layers[0].current_len - 1,
             )
             next_token = argmax(logits)
-            tokens.append(next_token)
+            all_tokens.append(next_token)
 
-        return tokens^
+        return all_tokens^

@@ -1,9 +1,9 @@
 from whisper_tensor import Tensor, matmul, layer_norm, softmax, gelu
 from loader import WeightLoader
-from math import sqrt
+from math import sqrt, exp
 from algorithm import parallelize
 from sys import simd_width_of as simdwidthof
-from memory import memcpy
+from memory import memcpy, LegacyUnsafePointer
 
 
 struct LayerCache(Copyable, ImplicitlyCopyable, Movable):
@@ -25,6 +25,8 @@ struct LayerCache(Copyable, ImplicitlyCopyable, Movable):
     fn reset(mut self, d_model: Int, max_len: Int):
         self.self_k = Tensor(max_len, d_model)
         self.self_v = Tensor(max_len, d_model)
+        self.cross_k = Tensor(1500, d_model)
+        self.cross_v = Tensor(1500, d_model)
         self.current_len = 0
         self.has_cross = False
 
@@ -129,24 +131,19 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
                 memcpy(dest=cache.self_v.data.offset(dest_offset), src=new_v.data, count=q_len * self.d_model)
                 cache.current_len += q_len
 
-                # Use full cache for attention
-                k = Tensor(cache.current_len, self.d_model)
-                v = Tensor(cache.current_len, self.d_model)
-                memcpy(dest=k.data, src=cache.self_k.data, count=cache.current_len * self.d_model)
-                memcpy(dest=v.data, src=cache.self_v.data, count=cache.current_len * self.d_model)
+                # Use full cache for attention without copying
+                k = Tensor.view(cache.self_k.data, cache.current_len, self.d_model)
+                v = Tensor.view(cache.self_v.data, cache.current_len, self.d_model)
             else:
                 # Cross attention
                 if not cache.has_cross:
-                    var ck = Tensor(k_len, self.d_model)
                     var k_bias_empty = Tensor(0, 0)
-                    matmul(ck, key, self.k_proj_w, k_bias_empty)
-                    var cv = Tensor(k_len, self.d_model)
-                    matmul(cv, value, self.v_proj_w, self.v_proj_b)
-                    cache.cross_k = ck^
-                    cache.cross_v = cv^
+                    matmul(cache.cross_k, key, self.k_proj_w, k_bias_empty)
+                    matmul(cache.cross_v, value, self.v_proj_w, self.v_proj_b)
                     cache.has_cross = True
-                k = cache.cross_k
-                v = cache.cross_v
+                
+                k = Tensor.view(cache.cross_k.data, k_len, self.d_model)
+                v = Tensor.view(cache.cross_v.data, k_len, self.d_model)
         else:
             k = Tensor(k_len, self.d_model)
             var k_bias_empty = Tensor(0, 0)
@@ -160,40 +157,118 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
 
         @parameter
         fn head_worker(h: Int):
-            var scores = Tensor(q_len, final_k_len)
             var scale = 1.0 / sqrt(Float32(self.head_dim))
-
-            for i in range(q_len):
+            
+            # Optimized path for decoder (q_len=1)
+            if q_len == 1:
+                var scores_ptr = LegacyUnsafePointer[Float32].alloc(1500)
+                var max_score = Float32(-1e10)
+                
+                # 1. Compute scores
                 for j in range(final_k_len):
                     var dot_simd = SIMD[DType.float32, width](0.0)
                     for d in range(0, self.head_dim, width):
-                        var q_vec = q.data.load[width=width](i * self.d_model + h * self.head_dim + d)
-                        var k_vec = k.data.load[width=width](j * self.d_model + h * self.head_dim + d)
-                        dot_simd += q_vec * k_vec
+                        dot_simd += q.data.load[width=width](h * self.head_dim + d) * k.data.load[width=width](j * self.d_model + h * self.head_dim + d)
                     
                     var score = dot_simd.reduce_add() * scale
-                    
-                    # Causal masking
-                    if mask and j > (
-                        cache.current_len - q_len + i if use_cache
-                        and is_self_attn else i
-                    ):
+                    if mask and j > (cache.current_len - 1 if use_cache and is_self_attn else 0):
                         score = -1e10
-
-                    scores.set(i, j, score)
-
-            softmax(scores)
-
-            for i in range(q_len):
+                    
+                    if score > max_score: max_score = score
+                    scores_ptr[j] = score
+                
+                # 2. Softmax inline (Vectorized with 1500 buffer safety)
+                var sum_exp_simd = SIMD[DType.float32, width](0.0)
+                var rounded_len = (final_k_len // width) * width
+                for j in range(0, rounded_len, width):
+                    var s = scores_ptr.load[width=width](j)
+                    var e = exp(s - max_score)
+                    scores_ptr.store[width=width](j, e)
+                    sum_exp_simd += e
+                
+                var sum_exp = sum_exp_simd.reduce_add()
+                for j in range(rounded_len, final_k_len):
+                    var e = exp(scores_ptr[j] - max_score)
+                    scores_ptr[j] = e
+                    sum_exp += e
+                
+                var inv_sum_exp = 1.0 / sum_exp
+                var inv_sum_simd = SIMD[DType.float32, width](inv_sum_exp)
+                for j in range(0, rounded_len, width):
+                    scores_ptr.store[width=width](j, scores_ptr.load[width=width](j) * inv_sum_simd)
+                for j in range(rounded_len, final_k_len):
+                    scores_ptr[j] *= inv_sum_exp
+                
+                # 3. Weighted sum
                 for d in range(0, self.head_dim, width):
                     var val_simd = SIMD[DType.float32, width](0.0)
                     for j in range(final_k_len):
-                        val_simd += SIMD[DType.float32, width](scores.get(i, j)) * v.data.load[width=width](
+                        val_simd += SIMD[DType.float32, width](scores_ptr[j]) * v.data.load[width=width](
                             j * self.d_model + h * self.head_dim + d
                         )
-                    out.data.store(i * self.d_model + h * self.head_dim + d, val_simd)
+                    out.data.store(h * self.head_dim + d, val_simd)
+                
+                scores_ptr.free()
+            else:
+                # Optimized block-based path for encoder/prefill using matmul
+                # Copy heads to contiguous tensors to use optimized matmul
+                var q_h = Tensor(q_len, self.head_dim)
+                var k_h = Tensor(final_k_len, self.head_dim)
+                var v_h = Tensor(final_k_len, self.head_dim)
+                
+                # Parallelize head-data extraction
+                @parameter
+                fn extract_worker(i: Int):
+                    if i < q_len:
+                        var q_off = i * self.d_model + h * self.head_dim
+                        memcpy(dest=q_h.data.offset(i * self.head_dim), src=q.data.offset(q_off), count=self.head_dim)
+                    
+                    if i < final_k_len:
+                        var k_off = i * self.d_model + h * self.head_dim
+                        memcpy(dest=k_h.data.offset(i * self.head_dim), src=k.data.offset(k_off), count=self.head_dim)
+                        memcpy(dest=v_h.data.offset(i * self.head_dim), src=v.data.offset(k_off), count=self.head_dim)
+                
+                parallelize[extract_worker](max(q_len, final_k_len))
+                
+                var scores = Tensor(q_len, final_k_len)
+                var empty_bias = Tensor(0, 0)
+                matmul(scores, q_h, k_h, empty_bias)
+                
+                # Scale, Mask and Softmax
+                @parameter
+                fn scale_mask_worker(i: Int):
+                    for j in range(final_k_len):
+                        var score = scores.get(i, j) * scale
+                        if mask and j > (cache.current_len - q_len + i if use_cache and is_self_attn else i):
+                            score = -1e10
+                        scores.set(i, j, score)
+                parallelize[scale_mask_worker](q_len)
+                
+                softmax(scores)
+                
+                # Weighted sum: out_h = scores * v_h
+                # matmul computes A * B.T. So we need B.T = v_h => B = v_h.T
+                # Transpose v_h: (final_k_len, head_dim) -> (head_dim, final_k_len)
+                var v_h_T = Tensor(self.head_dim, final_k_len)
+                for i in range(final_k_len):
+                    for j in range(self.head_dim):
+                        v_h_T.data[j * final_k_len + i] = v_h.data[i * self.head_dim + j]
+                
+                var out_h = Tensor(q_len, self.head_dim)
+                matmul(out_h, scores, v_h_T, empty_bias)
+                
+                # Copy back to out
+                @parameter
+                fn scatter_worker(i: Int):
+                    var out_off = i * self.d_model + h * self.head_dim
+                    memcpy(dest=out.data.offset(out_off), src=out_h.data.offset(i * self.head_dim), count=self.head_dim)
+                parallelize[scatter_worker](q_len)
 
-        parallelize[head_worker](self.n_heads)
+        if q_len == 1:
+            for h in range(self.n_heads):
+                head_worker(h)
+        else:
+            parallelize[head_worker](self.n_heads)
 
 
         var final_out = Tensor(q_len, self.d_model)
@@ -296,8 +371,11 @@ struct ResidualAttentionBlock(Copyable, ImplicitlyCopyable, Movable):
 
         var current_x = Tensor(x.rows, x.cols)
         alias width = simdwidthof[DType.float32]()
-        for i in range(0, x.size, width):
-            current_x.data.store(i, x.data.load[width=width](i) + self_attn_out.data.load[width=width](i))
+        @parameter
+        fn res1_worker(i: Int):
+            var off = i * width
+            current_x.data.store[width=width](off, x.data.load[width=width](off) + self_attn_out.data.load[width=width](off))
+        parallelize[res1_worker](x.size // width)
 
         if self.is_decoder and enc_out.size > 0:
             var x_norm_cross = Tensor(current_x.rows, current_x.cols)
@@ -319,8 +397,11 @@ struct ResidualAttentionBlock(Copyable, ImplicitlyCopyable, Movable):
             )
 
             var x_res2 = Tensor(current_x.rows, current_x.cols)
-            for i in range(0, current_x.size, width):
-                x_res2.data.store(i, current_x.data.load[width=width](i) + cross_attn_out.data.load[width=width](i))
+            @parameter
+            fn res2_worker(i: Int):
+                var off = i * width
+                x_res2.data.store[width=width](off, current_x.data.load[width=width](off) + cross_attn_out.data.load[width=width](off))
+            parallelize[res2_worker](current_x.size // width)
             current_x = x_res2
 
         var x_norm_mlp = Tensor(current_x.rows, current_x.cols)
@@ -334,8 +415,11 @@ struct ResidualAttentionBlock(Copyable, ImplicitlyCopyable, Movable):
         matmul(mlp_out, hidden, self.mlp_fc2_w, self.mlp_fc2_b)
 
         var final_out = Tensor(current_x.rows, current_x.cols)
-        for i in range(0, current_x.size, width):
-            final_out.data.store(i, current_x.data.load[width=width](i) + mlp_out.data.load[width=width](i))
+        @parameter
+        fn res3_worker(i: Int):
+            var off = i * width
+            final_out.data.store[width=width](off, current_x.data.load[width=width](off) + mlp_out.data.load[width=width](off))
+        parallelize[res3_worker](current_x.size // width)
 
         return final_out^
 
