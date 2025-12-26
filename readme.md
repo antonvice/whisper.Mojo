@@ -76,6 +76,15 @@ Transcription:
 --------------------
 ```
 
+## 📈 Changelog
+
+### [2025-12-26] - Performance Optimization Sprint
+*   **🚀 Optimized Matmul**: Implemented dynamic parallelization that adapts to matrix shapes. Added 1D tiling for better cache reuse and switched to hardware-native SIMD widths using `simdwidthof`.
+*   **⚡ Vectorized Attention**: Fully vectorized the inner loops of `MultiHeadAttention`, accelerating both the dot-product score calculation and the weighted value sum.
+*   **🧬 Optimized Tensor Primitives**: Vectorized `LayerNorm`, `Softmax`, and `GeLU` operations. Added safe tail-handling for non-multiple sequence lengths.
+*   **💾 Fast Memory Operations**: Replaced slow scalar loops in KV-cache management with high-performance `memcpy` transfers.
+*   **🧵 Threading Improvements**: Optimized thread distribution in decoder layers to ensure all CPU cores are utilized during incremental decoding (single-token generation).
+
 ## 📜 License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
