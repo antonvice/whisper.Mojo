@@ -2,7 +2,7 @@ from whisper_tensor import Tensor, matmul, layer_norm, softmax, gelu
 from loader import WeightLoader
 from math import sqrt
 from algorithm import parallelize
-from sys import simdwidthof
+from sys import simd_width_of as simdwidthof
 from memory import memcpy
 
 
@@ -125,15 +125,15 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
 
                 # Append to cache
                 var dest_offset = cache.current_len * self.d_model
-                memcpy(cache.self_k.data.offset(dest_offset), new_k.data, q_len * self.d_model)
-                memcpy(cache.self_v.data.offset(dest_offset), new_v.data, q_len * self.d_model)
+                memcpy(dest=cache.self_k.data.offset(dest_offset), src=new_k.data, count=q_len * self.d_model)
+                memcpy(dest=cache.self_v.data.offset(dest_offset), src=new_v.data, count=q_len * self.d_model)
                 cache.current_len += q_len
 
                 # Use full cache for attention
                 k = Tensor(cache.current_len, self.d_model)
                 v = Tensor(cache.current_len, self.d_model)
-                memcpy(k.data, cache.self_k.data, cache.current_len * self.d_model)
-                memcpy(v.data, cache.self_v.data, cache.current_len * self.d_model)
+                memcpy(dest=k.data, src=cache.self_k.data, count=cache.current_len * self.d_model)
+                memcpy(dest=v.data, src=cache.self_v.data, count=cache.current_len * self.d_model)
             else:
                 # Cross attention
                 if not cache.has_cross:

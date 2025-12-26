@@ -1,7 +1,7 @@
 from memory import LegacyUnsafePointer, memcpy, memset_zero
 from math import sqrt, tanh, exp
 from algorithm import parallelize
-from sys import simdwidthof
+from sys import simd_width_of as simdwidthof
 
 
 struct Tensor(Copyable, ImplicitlyCopyable, Movable):
