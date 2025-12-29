@@ -2,6 +2,9 @@ from memory import LegacyUnsafePointer, memcpy, memset_zero
 from math import sqrt, tanh, exp
 from algorithm import parallelize
 from sys import simd_width_of as simdwidthof
+from linalg.matmul import matmul as max_matmul
+from buffer import NDBuffer, DimList
+from config import D_MODEL, D_MODEL_X4, MAX_SEQ_LEN, VOCAB_SIZE, HEAD_DIM
 
 
 struct Tensor(Copyable, ImplicitlyCopyable, Movable):
@@ -47,6 +50,7 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
         self.is_view = existing.is_view
         self.data = existing.data
         existing.data = LegacyUnsafePointer[Float32]()
+        _ = existing # Suppress warning by indicating use
 
     fn deinit(owned self):
         if self.data and not self.is_view:
@@ -63,6 +67,85 @@ struct Tensor(Copyable, ImplicitlyCopyable, Movable):
 
     fn set(mut self, r: Int, c: Int, val: Float32):
         self.data[r * self.cols + c] = val
+
+
+# --- MAX Optimized Specialized Matmuls ---
+
+fn matmul_384x384[M: Int](mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor) raises:
+    """Static matmul for attention projections: C = A @ B.T + bias"""
+    var a_buf = NDBuffer[DType.float32, 2, _, DimList(M, D_MODEL)](A.data)
+    var b_buf = NDBuffer[DType.float32, 2, _, DimList(D_MODEL, D_MODEL)](B.data)
+    var c_buf = NDBuffer[DType.float32, 2, _, DimList(M, D_MODEL)](C.data)
+    max_matmul[transpose_b=True](c_buf, a_buf, b_buf)
+    
+    if bias.size > 0:
+        alias width = 8
+        @parameter
+        fn add_bias(m: Int):
+            var c_row = C.data + m * D_MODEL
+            for n in range(0, D_MODEL, width):
+                c_row.store(n, c_row.load[width=width](n) + bias.data.load[width=width](n))
+        parallelize[add_bias](M)
+
+
+fn matmul_384x1536[M: Int](mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor) raises:
+    """Static matmul for FFN fc1: C = A @ B.T + bias"""
+    var a_buf = NDBuffer[DType.float32, 2, _, DimList(M, D_MODEL)](A.data)
+    var b_buf = NDBuffer[DType.float32, 2, _, DimList(D_MODEL_X4, D_MODEL)](B.data)
+    var c_buf = NDBuffer[DType.float32, 2, _, DimList(M, D_MODEL_X4)](C.data)
+    max_matmul[transpose_b=True](c_buf, a_buf, b_buf)
+    
+    if bias.size > 0:
+        alias width = 8
+        @parameter
+        fn add_bias(m: Int):
+            var c_row = C.data + m * D_MODEL_X4
+            for n in range(0, D_MODEL_X4, width):
+                c_row.store(n, c_row.load[width=width](n) + bias.data.load[width=width](n))
+        parallelize[add_bias](M)
+
+
+fn matmul_1536x384[M: Int](mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor) raises:
+    """Static matmul for FFN fc2: C = A @ B.T + bias"""
+    var a_buf = NDBuffer[DType.float32, 2, _, DimList(M, D_MODEL_X4)](A.data)
+    var b_buf = NDBuffer[DType.float32, 2, _, DimList(D_MODEL, D_MODEL_X4)](B.data)
+    var c_buf = NDBuffer[DType.float32, 2, _, DimList(M, D_MODEL)](C.data)
+    max_matmul[transpose_b=True](c_buf, a_buf, b_buf)
+    
+    if bias.size > 0:
+        alias width = 8
+        @parameter
+        fn add_bias(m: Int):
+            var c_row = C.data + m * D_MODEL
+            for n in range(0, D_MODEL, width):
+                c_row.store(n, c_row.load[width=width](n) + bias.data.load[width=width](n))
+        parallelize[add_bias](M)
+
+
+fn matmul_384xVocab[M: Int](mut C: Tensor, A: Tensor, B: Tensor) raises:
+    """Static matmul for token logits: C = A @ B.T (no bias)"""
+    var a_buf = NDBuffer[DType.float32, 2, _, DimList(M, D_MODEL)](A.data)
+    var b_buf = NDBuffer[DType.float32, 2, _, DimList(VOCAB_SIZE, D_MODEL)](B.data)
+    var c_buf = NDBuffer[DType.float32, 2, _, DimList(M, VOCAB_SIZE)](C.data)
+    max_matmul[transpose_b=True](c_buf, a_buf, b_buf)
+
+fn matmul_Q_K[M: Int, K: Int](mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor) raises:
+    """Attention Scores: C = A @ B.T (M, K) @ (M, K).T -> (M, M)"""
+    var a_buf = NDBuffer[DType.float32, 2, _, DimList(M, K)](A.data)
+    var b_buf = NDBuffer[DType.float32, 2, _, DimList(M, K)](B.data)
+    var c_buf = NDBuffer[DType.float32, 2, _, DimList(M, M)](C.data)
+    max_matmul[transpose_b=True](c_buf, a_buf, b_buf)
+
+fn matmul_S_V[M: Int, K: Int](mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor) raises:
+    """Attention Values: C = A @ B (M, M) @ (M, K) -> (M, K)
+       Actually MAX prefers A @ B.T, so we pass B as (K, M) and transpose it.
+    """
+    var a_buf = NDBuffer[DType.float32, 2, _, DimList(M, M)](A.data)
+    var b_buf = NDBuffer[DType.float32, 2, _, DimList(K, M)](B.data)
+    var c_buf = NDBuffer[DType.float32, 2, _, DimList(M, K)](C.data)
+    max_matmul[transpose_b=True](c_buf, a_buf, b_buf)
+
+# --- End of MAX Optimized Kernels ---
 
 
 fn matmul(mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor):
@@ -91,7 +174,6 @@ fn matmul(mut C: Tensor, A: Tensor, B: Tensor, bias: Tensor):
                 C.store(m * N + n, final_sum)
         parallelize[worker_vector](N)
     else:
-        # For encoder (M=1500), parallelize over M
         @parameter
         fn worker_matrix(m: Int):
             alias tile_n = 8
@@ -281,6 +363,7 @@ fn transpose_conv_weights(w: Tensor, C_out: Int, C_in: Int, K: Int) -> Tensor:
                 new_w.data[(co * K + k) * C_in + ci] = w.data[co * (C_in * K) + ci * K + k]
     return new_w
 
+
 fn conv1d(
     mut out: Tensor,
     inp: Tensor,
@@ -288,15 +371,15 @@ fn conv1d(
     bias: Tensor,
     stride: Int,
     padding: Int,
+    out_T: Bool = False,
 ):
     alias width = simdwidthof[DType.float32]()
-    var C_out = out.rows
-    var L_out = out.cols
     var C_in = inp.rows
     var L_in = inp.cols
-    var K = weight.size // (C_out * C_in)
+    var K = 3
+    var C_out = weight.rows // K
+    var L_out = (L_in + 2 * padding - K) // stride + 1
 
-    # 1. Transpose input from (C_in, L_in) to (L_in, C_in)
     var inp_T = Tensor(L_in, C_in)
     @parameter
     fn trans_inp(li: Int):
@@ -304,53 +387,45 @@ fn conv1d(
             inp_T.data[li * C_in + ci] = inp.data[ci * L_in + li]
     parallelize[trans_inp](L_in)
 
-    # Note: Weights should be pre-transposed to (C_out, K, C_in) for maximum speed.
-    # For now, we'll assume they are already in the right layout or we'll handle it once.
-
-    @parameter
-    fn worker(co: Int):
-        var b = bias.data[co]
-        for lo in range(L_out):
-            var dot_simd = SIMD[DType.float32, width](0.0)
-            var start_l = lo * stride - padding
-            
-            # Manually unroll K=3 for Whisper
-            if K == 3:
-                # k = 0
-                var li0 = start_l
-                if li0 >= 0 and li0 < L_in:
-                    var li0_off = li0 * C_in
-                    var w0_off = (co * 3 + 0) * C_in
-                    for ci in range(0, C_in, width):
-                        dot_simd += inp_T.data.load[width=width](li0_off + ci) * weight.data.load[width=width](w0_off + ci)
-                
-                # k = 1
-                var li1 = start_l + 1
-                if li1 >= 0 and li1 < L_in:
-                    var li1_off = li1 * C_in
-                    var w1_off = (co * 3 + 1) * C_in
-                    for ci in range(0, C_in, width):
-                        dot_simd += inp_T.data.load[width=width](li1_off + ci) * weight.data.load[width=width](w1_off + ci)
-                
-                # k = 2
-                var li2 = start_l + 2
-                if li2 >= 0 and li2 < L_in:
-                    var li2_off = li2 * C_in
-                    var w2_off = (co * 3 + 2) * C_in
-                    for ci in range(0, C_in, width):
-                        dot_simd += inp_T.data.load[width=width](li2_off + ci) * weight.data.load[width=width](w2_off + ci)
-            else:
+    if out_T:
+        alias block_size = 16
+        var num_blocks = (C_out + block_size - 1) // block_size
+        @parameter
+        fn worker_T_blocked(b: Int):
+            var start_co = b * block_size
+            var end_co = min(start_co + block_size, C_out)
+            for co in range(start_co, end_co):
+                var b_val = bias.data[co]
+                var w_base = co * 3 * C_in
+                for lo in range(L_out):
+                    var dot_simd = SIMD[DType.float32, width](0.0)
+                    var start_l = lo * stride - padding
+                    for k in range(K):
+                        var li = start_l + k
+                        if li >= 0 and li < L_in:
+                            var li_off = li * C_in
+                            var w_off = w_base + k * C_in
+                            for ci in range(0, C_in, width):
+                                dot_simd += inp_T.data.load[width=width](li_off + ci) * weight.data.load[width=width](w_off + ci)
+                    out.data[lo * C_out + co] = dot_simd.reduce_add() + b_val
+        parallelize[worker_T_blocked](num_blocks)
+    else:
+        @parameter
+        fn worker_std(co: Int):
+            var b_val = bias.data[co]
+            var w_base = co * 3 * C_in
+            for lo in range(L_out):
+                var dot_simd = SIMD[DType.float32, width](0.0)
+                var start_l = lo * stride - padding
                 for k in range(K):
                     var li = start_l + k
                     if li >= 0 and li < L_in:
                         var li_off = li * C_in
-                        var w_off = (co * K + k) * C_in
+                        var w_off = w_base + k * C_in
                         for ci in range(0, C_in, width):
                             dot_simd += inp_T.data.load[width=width](li_off + ci) * weight.data.load[width=width](w_off + ci)
-            
-            out.data[co * L_out + lo] = dot_simd.reduce_add() + b
-
-    parallelize[worker](C_out, 32)
+                out.data[co * L_out + lo] = dot_simd.reduce_add() + b_val
+        parallelize[worker_std](C_out, 32)
 
 
 fn argmax(t: Tensor) -> Int:

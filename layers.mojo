@@ -1,4 +1,9 @@
-from whisper_tensor import Tensor, matmul, layer_norm, softmax, gelu
+from whisper_tensor import (
+    Tensor, matmul, layer_norm, softmax, gelu,
+    matmul_384x384, matmul_384x1536, matmul_1536x384,
+    matmul_Q_K, matmul_S_V
+)
+from config import MAX_SEQ_LEN, HEAD_DIM
 from loader import WeightLoader
 from math import sqrt, exp
 from algorithm import parallelize
@@ -111,7 +116,13 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
         var k_len = key.rows
 
         var q = Tensor(q_len, self.d_model)
-        matmul(q, query, self.q_proj_w, self.q_proj_b)
+        if q_len == MAX_SEQ_LEN:
+            try:
+                matmul_384x384[MAX_SEQ_LEN](q, query, self.q_proj_w, self.q_proj_b)
+            except:
+                matmul(q, query, self.q_proj_w, self.q_proj_b)
+        else:
+            matmul(q, query, self.q_proj_w, self.q_proj_b)
 
         var k: Tensor
         var v: Tensor
@@ -147,28 +158,56 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
         else:
             k = Tensor(k_len, self.d_model)
             var k_bias_empty = Tensor(0, 0)
-            matmul(k, key, self.k_proj_w, k_bias_empty)
+            if k_len == MAX_SEQ_LEN:
+                try:
+                    matmul_384x384[MAX_SEQ_LEN](k, key, self.k_proj_w, k_bias_empty)
+                except:
+                    matmul(k, key, self.k_proj_w, k_bias_empty)
+            else:
+                matmul(k, key, self.k_proj_w, k_bias_empty)
+
             v = Tensor(k_len, self.d_model)
-            matmul(v, value, self.v_proj_w, self.v_proj_b)
+            if k_len == MAX_SEQ_LEN:
+                try:
+                    matmul_384x384[MAX_SEQ_LEN](v, value, self.v_proj_w, self.v_proj_b)
+                except:
+                    matmul(v, value, self.v_proj_w, self.v_proj_b)
+            else:
+                matmul(v, value, self.v_proj_w, self.v_proj_b)
 
         var final_k_len = k.rows
         var out = Tensor(q_len, self.d_model)
-        alias width = simdwidthof[DType.float32]()
+        alias width = 8
 
         @parameter
         fn head_worker(h: Int):
             var scale = 1.0 / sqrt(Float32(self.head_dim))
             
-            # Optimized path for decoder (q_len=1)
             if q_len == 1:
                 var scores_ptr = LegacyUnsafePointer[Float32].alloc(1500)
                 var max_score = Float32(-1e10)
                 
+                # Hoist query head into registers (head_dim=64, so 8 SIMD registers)
+                var q0 = q.data.load[width=width](h * self.head_dim + 0)
+                var q1 = q.data.load[width=width](h * self.head_dim + 8)
+                var q2 = q.data.load[width=width](h * self.head_dim + 16)
+                var q3 = q.data.load[width=width](h * self.head_dim + 24)
+                var q4 = q.data.load[width=width](h * self.head_dim + 32)
+                var q5 = q.data.load[width=width](h * self.head_dim + 40)
+                var q6 = q.data.load[width=width](h * self.head_dim + 48)
+                var q7 = q.data.load[width=width](h * self.head_dim + 56)
+                
                 # 1. Compute scores
                 for j in range(final_k_len):
-                    var dot_simd = SIMD[DType.float32, width](0.0)
-                    for d in range(0, self.head_dim, width):
-                        dot_simd += q.data.load[width=width](h * self.head_dim + d) * k.data.load[width=width](j * self.d_model + h * self.head_dim + d)
+                    var k_ptr = k.data.offset(j * self.d_model + h * self.head_dim)
+                    var dot_simd = q0 * k_ptr.load[width=width](0)
+                    dot_simd += q1 * k_ptr.load[width=width](8)
+                    dot_simd += q2 * k_ptr.load[width=width](16)
+                    dot_simd += q3 * k_ptr.load[width=width](24)
+                    dot_simd += q4 * k_ptr.load[width=width](32)
+                    dot_simd += q5 * k_ptr.load[width=width](40)
+                    dot_simd += q6 * k_ptr.load[width=width](48)
+                    dot_simd += q7 * k_ptr.load[width=width](56)
                     
                     var score = dot_simd.reduce_add() * scale
                     if mask and j > (cache.current_len - 1 if use_cache and is_self_attn else 0):
@@ -177,7 +216,7 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
                     if score > max_score: max_score = score
                     scores_ptr[j] = score
                 
-                # 2. Softmax inline (Vectorized with 1500 buffer safety)
+                # 2. Softmax inline
                 var sum_exp_simd = SIMD[DType.float32, width](0.0)
                 var rounded_len = (final_k_len // width) * width
                 for j in range(0, rounded_len, width):
@@ -199,19 +238,40 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
                 for j in range(rounded_len, final_k_len):
                     scores_ptr[j] *= inv_sum_exp
                 
-                # 3. Weighted sum
-                for d in range(0, self.head_dim, width):
-                    var val_simd = SIMD[DType.float32, width](0.0)
-                    for j in range(final_k_len):
-                        val_simd += SIMD[DType.float32, width](scores_ptr[j]) * v.data.load[width=width](
-                            j * self.d_model + h * self.head_dim + d
-                        )
-                    out.data.store(h * self.head_dim + d, val_simd)
+                # 3. Weighted sum (hoist output into registers)
+                var o0 = SIMD[DType.float32, width](0.0)
+                var o1 = SIMD[DType.float32, width](0.0)
+                var o2 = SIMD[DType.float32, width](0.0)
+                var o3 = SIMD[DType.float32, width](0.0)
+                var o4 = SIMD[DType.float32, width](0.0)
+                var o5 = SIMD[DType.float32, width](0.0)
+                var o6 = SIMD[DType.float32, width](0.0)
+                var o7 = SIMD[DType.float32, width](0.0)
+                
+                for j in range(final_k_len):
+                    var s = SIMD[DType.float32, width](scores_ptr[j])
+                    var v_ptr = v.data.offset(j * self.d_model + h * self.head_dim)
+                    o0 += s * v_ptr.load[width=width](0)
+                    o1 += s * v_ptr.load[width=width](8)
+                    o2 += s * v_ptr.load[width=width](16)
+                    o3 += s * v_ptr.load[width=width](24)
+                    o4 += s * v_ptr.load[width=width](32)
+                    o5 += s * v_ptr.load[width=width](40)
+                    o6 += s * v_ptr.load[width=width](48)
+                    o7 += s * v_ptr.load[width=width](56)
+                
+                out.data.store[width=width](h * self.head_dim + 0, o0)
+                out.data.store[width=width](h * self.head_dim + 8, o1)
+                out.data.store[width=width](h * self.head_dim + 16, o2)
+                out.data.store[width=width](h * self.head_dim + 24, o3)
+                out.data.store[width=width](h * self.head_dim + 32, o4)
+                out.data.store[width=width](h * self.head_dim + 40, o5)
+                out.data.store[width=width](h * self.head_dim + 48, o6)
+                out.data.store[width=width](h * self.head_dim + 56, o7)
                 
                 scores_ptr.free()
             else:
                 # Optimized block-based path for encoder/prefill using matmul
-                # Copy heads to contiguous tensors to use optimized matmul
                 var q_h = Tensor(q_len, self.head_dim)
                 var k_h = Tensor(final_k_len, self.head_dim)
                 var v_h = Tensor(final_k_len, self.head_dim)
@@ -232,12 +292,27 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
                 
                 var scores = Tensor(q_len, final_k_len)
                 var empty_bias = Tensor(0, 0)
-                matmul(scores, q_h, k_h, empty_bias)
+                if q_len == MAX_SEQ_LEN:
+                    try:
+                        matmul_Q_K[MAX_SEQ_LEN, HEAD_DIM](scores, q_h, k_h, empty_bias)
+                    except:
+                        matmul(scores, q_h, k_h, empty_bias)
+                else:
+                    matmul(scores, q_h, k_h, empty_bias)
                 
                 # Scale, Mask and Softmax
                 @parameter
                 fn scale_mask_worker(i: Int):
-                    for j in range(final_k_len):
+                    var scale_simd = SIMD[DType.float32, width](scale)
+                    for j in range(0, final_k_len - final_k_len % width, width):
+                        var s_vec = scores.data.load[width=width](i * final_k_len + j) * scale_simd
+                        if mask:
+                            for w in range(width):
+                                if j + w > (cache.current_len - q_len + i if use_cache and is_self_attn else i):
+                                    s_vec[w] = -1e10
+                        scores.data.store[width=width](i * final_k_len + j, s_vec)
+                    
+                    for j in range(final_k_len - final_k_len % width, final_k_len):
                         var score = scores.get(i, j) * scale
                         if mask and j > (cache.current_len - q_len + i if use_cache and is_self_attn else i):
                             score = -1e10
@@ -246,18 +321,20 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
                 
                 softmax(scores)
                 
-                # Weighted sum: out_h = scores * v_h
-                # matmul computes A * B.T. So we need B.T = v_h => B = v_h.T
-                # Transpose v_h: (final_k_len, head_dim) -> (head_dim, final_k_len)
                 var v_h_T = Tensor(self.head_dim, final_k_len)
                 for i in range(final_k_len):
                     for j in range(self.head_dim):
                         v_h_T.data[j * final_k_len + i] = v_h.data[i * self.head_dim + j]
                 
                 var out_h = Tensor(q_len, self.head_dim)
-                matmul(out_h, scores, v_h_T, empty_bias)
+                if q_len == MAX_SEQ_LEN:
+                    try:
+                        matmul_S_V[MAX_SEQ_LEN, HEAD_DIM](out_h, scores, v_h_T, empty_bias)
+                    except:
+                        matmul(out_h, scores, v_h_T, empty_bias)
+                else:
+                    matmul(out_h, scores, v_h_T, empty_bias)
                 
-                # Copy back to out
                 @parameter
                 fn scatter_worker(i: Int):
                     var out_off = i * self.d_model + h * self.head_dim
@@ -272,7 +349,13 @@ struct MultiHeadAttention(Copyable, ImplicitlyCopyable, Movable):
 
 
         var final_out = Tensor(q_len, self.d_model)
-        matmul(final_out, out, self.out_proj_w, self.out_proj_b)
+        if q_len == MAX_SEQ_LEN:
+            try:
+                matmul_384x384[MAX_SEQ_LEN](final_out, out, self.out_proj_w, self.out_proj_b)
+            except:
+                matmul(final_out, out, self.out_proj_w, self.out_proj_b)
+        else:
+            matmul(final_out, out, self.out_proj_w, self.out_proj_b)
         return final_out^
 
     fn __copyinit__(out self, existing: Self):
@@ -370,7 +453,7 @@ struct ResidualAttentionBlock(Copyable, ImplicitlyCopyable, Movable):
         )
 
         var current_x = Tensor(x.rows, x.cols)
-        alias width = simdwidthof[DType.float32]()
+        alias width = 8
         @parameter
         fn res1_worker(i: Int):
             var off = i * width
@@ -408,11 +491,23 @@ struct ResidualAttentionBlock(Copyable, ImplicitlyCopyable, Movable):
         layer_norm(x_norm_mlp, current_x, self.mlp_ln_w, self.mlp_ln_b)
 
         var hidden = Tensor(current_x.rows, self.d_model * 4)
-        matmul(hidden, x_norm_mlp, self.mlp_fc1_w, self.mlp_fc1_b)
+        if current_x.rows == MAX_SEQ_LEN:
+            try:
+                matmul_384x1536[MAX_SEQ_LEN](hidden, x_norm_mlp, self.mlp_fc1_w, self.mlp_fc1_b)
+            except:
+                matmul(hidden, x_norm_mlp, self.mlp_fc1_w, self.mlp_fc1_b)
+        else:
+            matmul(hidden, x_norm_mlp, self.mlp_fc1_w, self.mlp_fc1_b)
         gelu(hidden)
 
         var mlp_out = Tensor(current_x.rows, current_x.cols)
-        matmul(mlp_out, hidden, self.mlp_fc2_w, self.mlp_fc2_b)
+        if current_x.rows == MAX_SEQ_LEN:
+            try:
+                matmul_1536x384[MAX_SEQ_LEN](mlp_out, hidden, self.mlp_fc2_w, self.mlp_fc2_b)
+            except:
+                matmul(mlp_out, hidden, self.mlp_fc2_w, self.mlp_fc2_b)
+        else:
+            matmul(mlp_out, hidden, self.mlp_fc2_w, self.mlp_fc2_b)
 
         var final_out = Tensor(current_x.rows, current_x.cols)
         @parameter

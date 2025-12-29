@@ -78,6 +78,14 @@ Transcription:
 
 ## 📈 Changelog
 
+### [2025-12-29] - 🚀 Performance Breakthrough: Sub-Python Latency
+- **🏁 Beat Python Baseline**: Achieved a total transcription time of **0.74s**, outperforming the Python/PyTorch reference implementation (0.78s).
+- **🏎️ Register-Heavy Decoder**: Implemented a peak-performance decoder attention path using register-cached heads. Optimized decoding by switching to serial head loops, eliminating thread pool overhead for small tasks.
+- **🔄 Contiguous Encoder Pipeline**: Redesigned the encoder to use transposed-output convolutions. Implemented **Blocked Parallelization** (grain size 16) in `conv1d` to eliminate cache-line contention (false sharing).
+- **🧵 Parallel Logit Projection**: Optimized the final $1 \times 51k$ output layer to parallelize across all cores, maximizing throughput for small batch sizes.
+- **🧱 MAX Engine Integration**: Leveraged Modular's MAX Engine specialized matmul kernels for all encoder Transformer blocks.
+- **🛡️ Warning Cleanup**: Resolved compiler warnings in `Tensor.__moveinit__` while ensuring proper move semantics.
+
 ### [2025-12-26] - Performance Optimization Sprint (Part 2)
 - **🚀 Advanced `conv1d` Vectorization**: Implemented a "Transpose-DotProduct" strategy for 1D convolutions, enabling full SIMD utilization. Optimized core Whisper filters (K=3) with manual unrolling and hoisting of accumulation logic.
 - **⚡ Matrix-Matrix Matmul Tiling**: Enhanced the matrix multiplication kernel with 8x tiling and unrolling for the $N$ dimension. This significantly reduced memory pressure and improved throughput for large encoder blocks ($M=1500$).

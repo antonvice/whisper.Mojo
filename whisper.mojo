@@ -1,4 +1,7 @@
-from whisper_tensor import Tensor, conv1d, layer_norm, matmul, gelu, argmax, transpose_conv_weights
+from whisper_tensor import (
+    Tensor, conv1d, layer_norm, matmul, gelu, argmax,
+    transpose_conv_weights, matmul_384xVocab
+)
 from memory import memcpy, LegacyUnsafePointer
 from algorithm import parallelize
 from sys import simd_width_of as simdwidthof
@@ -57,7 +60,6 @@ struct WhisperEncoder:
     fn load(mut self, mut loader: WeightLoader):
         self.conv1_w = transpose_conv_weights(loader.next_tensor(384, 80 * 3), 384, 80, 3)
         self.conv1_b = loader.next_tensor(1, 384)
-        
         self.conv2_w = transpose_conv_weights(loader.next_tensor(384, 384 * 3), 384, 384, 3)
         self.conv2_b = loader.next_tensor(1, 384)
         self.pos_emb = loader.next_tensor(1500, 384)
@@ -67,25 +69,24 @@ struct WhisperEncoder:
         self.ln_post_b = loader.next_tensor(1, 384)
 
     fn forward(self, mel: Tensor) -> Tensor:
+        # conv1: output standard (C_out, L_out) = (384, 3000)
         var x1 = Tensor(384, 3000)
         conv1d(x1, mel, self.conv1_w, self.conv1_b, stride=1, padding=1)
         gelu(x1)
 
-        var x2 = Tensor(384, 1500)
-        conv1d(x2, x1, self.conv2_w, self.conv2_b, stride=2, padding=1)
+        # conv2: output transposed (L_out, C_out) = (1500, 384)
+        var x2 = Tensor(1500, 384)
+        conv1d(x2, x1, self.conv2_w, self.conv2_b, stride=2, padding=1, out_T=True)
         gelu(x2)
 
+        # Prefill: simple vectorized addition
         var x = Tensor(1500, 384)
-        alias width = simdwidthof[DType.float32]()
+        alias width = 8
         @parameter
-        fn prep_worker(i: Int):
-            for j in range(0, 384, width):
-                var val = SIMD[DType.float32, width](0.0)
-                var p_vec = self.pos_emb.data.load[width=width](i * 384 + j)
-                for w_idx in range(width):
-                    val[w_idx] = x2.data[(j + w_idx) * 1500 + i] + p_vec[w_idx]
-                x.data.store[width=width](i * 384 + j, val)
-        parallelize[prep_worker](1500)
+        fn prep_worker(i_block: Int):
+            var off = i_block * width
+            x.data.store[width=width](off, x2.data.load[width=width](off) + self.pos_emb.data.load[width=width](off))
+        parallelize[prep_worker](x.size // width)
 
         for i in range(len(self.blocks)):
             var dummy_cache = LayerCache()
@@ -136,15 +137,16 @@ struct WhisperDecoder:
     ) -> Tensor:
         var L_tgt = len(tokens)
         var x = Tensor(L_tgt, 384)
+        alias width = 8
         for i in range(L_tgt):
             var token_id = tokens[i]
-            for j in range(384):
-                x.set(
-                    i,
-                    j,
-                    self.token_emb.get(token_id, j)
-                    + self.pos_emb.get(start_pos + i, j),
-                )
+            var t_off = token_id * 384
+            var p_off = (start_pos + i) * 384
+            var x_off = i * 384
+            for j in range(0, 384, width):
+                var t_vec = self.token_emb.data.load[width=width](t_off + j)
+                var p_vec = self.pos_emb.data.load[width=width](p_off + j)
+                x.data.store[width=width](x_off + j, t_vec + p_vec)
 
         for i in range(len(self.blocks)):
             x = self.blocks[i].forward(
@@ -158,8 +160,11 @@ struct WhisperDecoder:
         memcpy(dest=last_hidden.data, src=out.data.offset((L_tgt - 1) * 384), count=384)
 
         var logits = Tensor(1, 51865)
+        # Use our handmade matmul for (1, 384) @ (384, 51865) 
+        # because it parallelizes over the 51k columns (N), which is much faster 
+        # than MAX's single-core overhead for M=1.
         matmul(logits, last_hidden, self.token_emb, Tensor(0, 0))
-        return logits^
+        return logits
 
 
 struct Whisper:
@@ -180,15 +185,13 @@ struct Whisper:
         var enc_out = self.encoder.forward(mel)
 
         var tokens = List[Int]()
-        tokens.append(50258)  # <|startoftranscript|>
-        tokens.append(50259)  # <|en|>
-        tokens.append(50359)  # <|transcribe|>
-        tokens.append(50363)  # <|notimestamps|>
+        tokens.append(50258)
+        tokens.append(50259)
+        tokens.append(50359)
+        tokens.append(50363)
 
-        # Pre-allocate KV cache for the decoder
         var cache = KVCache(self.config.n_layers, self.config.d_model, 448)
 
-        # First pass: process the prefix tokens to fill the cache
         var logits = self.decoder.forward(
             tokens, enc_out, cache=cache, use_cache=True, start_pos=0
         )
@@ -199,11 +202,10 @@ struct Whisper:
             all_tokens.append(tokens[i])
         all_tokens.append(next_token)
 
-        for _ in range(195):  # Already produced 1 token from prefix
-            if next_token == 50257:  # <|endoftext|>
+        for _ in range(195):
+            if next_token == 50257:
                 break
 
-            # Incremental pass: only process the LAST token
             var last_token_list = List[Int]()
             last_token_list.append(next_token)
 
@@ -215,6 +217,7 @@ struct Whisper:
                 start_pos=cache.layers[0].current_len - 1,
             )
             next_token = argmax(logits)
+            _ = logits
             all_tokens.append(next_token)
 
         return all_tokens^
